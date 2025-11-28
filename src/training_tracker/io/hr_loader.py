@@ -53,3 +53,33 @@ def load_hr(input_dir: Path) -> pd.DataFrame:
     df["org_desc"] = df["org_desc"].astype(str)
 
     return df[needed]
+
+
+def load_curriculum_list(input_dir: Path) -> pd.DataFrame:
+    """Lee hr/Curriculum_List.xlsx y regresa un DF canónico.
+
+    Esta lista define los ÚNICOS curriculums que se deben analizar e incluir en las salidas.
+
+    Columnas de salida:
+    - curriculum_id
+    - curriculum_title
+    """
+    path = input_dir / "hr" / "Curriculum_List.xlsx"
+    if not path.exists():
+        raise FileNotFoundError(f"No se encontró Curriculum_List.xlsx en: {path}")
+
+    df = pd.read_excel(path)
+    df = normalize_columns(df)
+
+    needed = ["curriculum_id", "curriculum_title"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Curriculum_List: faltan columnas esperadas: {missing}")
+
+    out = df[needed].copy()
+    out["curriculum_id"] = out["curriculum_id"].astype(str).str.strip()
+    out["curriculum_title"] = out["curriculum_title"].astype(str).str.strip()
+
+    out = out[~out["curriculum_id"].isin(["", "nan", "None"])].drop_duplicates(subset=["curriculum_id"]).reset_index(drop=True)
+
+    return out

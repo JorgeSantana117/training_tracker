@@ -163,11 +163,18 @@ def compute_employee_kpis(
     status_subset = status_subset[~status_subset["__employee_key"].isna()].copy()
     status_subset["curriculum_id"] = status_subset["curriculum_id"].astype(str)
 
+
+    # Deduplicar por si hay múltiples registros del mismo currículo por empleado
+    status_subset = (
+        status_subset.groupby(["__employee_key", "curriculum_id"], as_index=False)["curriculum_completed"].max()
+    )
     req_with_status = required.merge(
         status_subset,
         on=["__employee_key", "curriculum_id"],
         how="left",
     )
+    # is_assigned: True si existe registro en Trainings_Report para (empleado, curriculum)
+    req_with_status["is_assigned"] = req_with_status["curriculum_completed"].notna()
     req_with_status["curriculum_completed"] = req_with_status["curriculum_completed"].fillna(False).astype(bool)
 
     # --- 5) Agregados por empleado ---
@@ -179,6 +186,17 @@ def compute_employee_kpis(
         )
         .reset_index()
     )
+    # mandatorios sin asignar (no hay registro en Trainings_Report)
+    unassigned = (
+        req_with_status[(req_with_status["is_mandatory"] == True) & (~req_with_status["is_assigned"])]
+        .groupby("__employee_key")
+        .size()
+        .rename("unassigned_mandatory_count")
+        .reset_index()
+    )
+    agg_req = agg_req.merge(unassigned, on="__employee_key", how="left")
+    agg_req["unassigned_mandatory_count"] = agg_req["unassigned_mandatory_count"].fillna(0).astype(int)
+
     agg_req["missing_required_count"] = agg_req["required_count"] - agg_req["completed_required_count"]
     agg_req["has_requirements"] = agg_req["required_count"] > 0
     agg_req["completion_pct"] = agg_req.apply(
@@ -201,9 +219,8 @@ def compute_employee_kpis(
 
     employee_kpis_df = base_emp.merge(agg_req, on="__employee_key", how="left")
 
-    for col in ["required_count", "completed_required_count", "missing_required_count"]:
+    for col in ["required_count", "completed_required_count", "missing_required_count", "unassigned_mandatory_count"]:
         employee_kpis_df[col] = employee_kpis_df[col].fillna(0).astype(int)
-
     employee_kpis_df["has_requirements"] = employee_kpis_df["required_count"] > 0
     employee_kpis_df["completion_pct"] = employee_kpis_df["completion_pct"].astype(float)
     employee_kpis_df["full_compliance_flag"] = employee_kpis_df["full_compliance_flag"].fillna(False).astype(bool)
@@ -220,6 +237,7 @@ def compute_employee_kpis(
             "curriculum_id",
             "curriculum_title",
             "is_mandatory",
+            "is_assigned",
             "curriculum_completed",
         ]
     ].copy()
@@ -264,7 +282,7 @@ def compute_employee_kpis(
             "curriculum_id",
             "curriculum_title",
             "is_mandatory",
-            "curriculum_completed",
+                        "curriculum_completed",
         ]
     ].copy()
 
@@ -296,6 +314,7 @@ def compute_employee_kpis(
             "required_count",
             "completed_required_count",
             "missing_required_count",
+            "unassigned_mandatory_count",
             "has_requirements",
             "completion_pct",
             "full_compliance_flag",
@@ -314,6 +333,7 @@ def compute_employee_kpis(
             "curriculum_id",
             "curriculum_title",
             "is_mandatory",
+            "is_assigned",
             "curriculum_completed",
         ]
     ].copy()

@@ -3,7 +3,7 @@ import pandas as pd
 import click
 
 from .config import get_settings
-from .io.hr_loader import load_hr
+from .io.hr_loader import load_hr, load_curriculum_list
 from .io.roles_loader import load_roles
 from .io.status_loader import load_status
 from .processing.validation import validate_data
@@ -29,6 +29,30 @@ def _load_all():
     hr_df = load_hr(input_dir)
     roles_df = load_roles(input_dir)
     status_df = load_status(input_dir)
+
+    # --- Curriculum List (whitelist) ---
+    curriculum_df = load_curriculum_list(input_dir)
+    curriculum_df["curriculum_id"] = curriculum_df["curriculum_id"].astype(str).str.strip()
+    allowed = set(curriculum_df["curriculum_id"].tolist())
+    title_map = dict(zip(curriculum_df["curriculum_id"], curriculum_df["curriculum_title"]))
+
+    # Filtra Roles/Status a la lista permitida
+    roles_df["curriculum_id"] = roles_df["curriculum_id"].astype(str).str.strip()
+    status_df["curriculum_id"] = status_df["curriculum_id"].astype(str).str.strip()
+
+    roles_df = roles_df[roles_df["curriculum_id"].isin(allowed)].copy()
+    status_df = status_df[status_df["curriculum_id"].isin(allowed)].copy()
+
+    # Homologar títulos con la lista oficial
+    if "curriculum_title" in roles_df.columns:
+        roles_df["curriculum_title"] = roles_df["curriculum_id"].map(title_map).fillna(roles_df["curriculum_title"])
+    else:
+        roles_df["curriculum_title"] = roles_df["curriculum_id"].map(title_map)
+
+    if "curriculum_title" in status_df.columns:
+        status_df["curriculum_title"] = status_df["curriculum_id"].map(title_map).fillna(status_df["curriculum_title"])
+    else:
+        status_df["curriculum_title"] = status_df["curriculum_id"].map(title_map)
 
     return settings, hr_df, roles_df, status_df
 
