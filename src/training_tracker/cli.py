@@ -108,7 +108,7 @@ def build_outputs():
 
     click.echo("✅ Validaciones OK. Calculando KPIs...")
 
-    employee_kpis_df, required_detail_df, extra_detail_df = compute_employee_kpis(
+    employee_kpis_df, mandatory_detail_df, optional_detail_df = compute_employee_kpis(
         hr_df=hr_df,
         roles_df=roles_df,
         status_df=status_df,
@@ -116,13 +116,13 @@ def build_outputs():
     )
     dept_kpis_df = compute_department_kpis(employee_kpis_df)
     org_kpis_df = compute_organization_kpis(employee_kpis_df)
-    company_kpis_df = compute_company_kpis(employee_kpis_df, required_detail_df)
+    company_kpis_df = compute_company_kpis(employee_kpis_df, mandatory_detail_df)
 
     export_all(
         output_dir=output_dir,
         employee_kpis_df=employee_kpis_df,
-        required_detail_df=required_detail_df,
-        extra_detail_df=extra_detail_df,
+        mandatory_detail_df=mandatory_detail_df,
+        optional_detail_df=optional_detail_df,
         dept_kpis_df=dept_kpis_df,
         company_kpis_df=company_kpis_df,
         org_kpis_df=org_kpis_df,

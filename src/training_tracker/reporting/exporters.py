@@ -9,8 +9,8 @@ def ensure_output_dir(path: Path) -> None:
 def export_all(
     output_dir: Path,
     employee_kpis_df: pd.DataFrame,
-    required_detail_df: pd.DataFrame,
-    extra_detail_df: pd.DataFrame,
+    mandatory_detail_df: pd.DataFrame,
+    optional_detail_df: pd.DataFrame,
     dept_kpis_df: pd.DataFrame,
     company_kpis_df: pd.DataFrame,
     org_kpis_df: pd.DataFrame,
@@ -23,8 +23,8 @@ def export_all(
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         employee_kpis_df.to_excel(writer, sheet_name="employee_kpis", index=False)
-        required_detail_df.to_excel(writer, sheet_name="employee_required_detail", index=False)
-        extra_detail_df.to_excel(writer, sheet_name="employee_extra_detail", index=False)
+        mandatory_detail_df.to_excel(writer, sheet_name="employee_mandatory_detail", index=False)
+        optional_detail_df.to_excel(writer, sheet_name="employee_optional_detail", index=False)
         dept_kpis_df.to_excel(writer, sheet_name="department_kpis", index=False)
         org_kpis_df.to_excel(writer, sheet_name="organization_kpis", index=False)
         company_kpis_df.to_excel(writer, sheet_name="company_kpis", index=False)

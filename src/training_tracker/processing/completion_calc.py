@@ -80,17 +80,31 @@ def compute_employee_kpis(
     status_df: pd.DataFrame,
     reference_year: int | None = None,  # compatibilidad: ya no se usa
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Calcula KPIs a nivel empleado y detalle requerido/extra.
+    """Calcula KPIs a nivel empleado y detalle Mandatory/Optional.
 
     Entradas (canónicas):
     - hr_df: full_name, job_title, org_code, org_desc, head_of_department
-    - roles_df: org_code, org_desc, job_title, curriculum_id, curriculum_title, is_mandatory
+    - roles_df: org_code, org_desc, job_title, curriculum_id, curriculum_title, required_type, is_mandatory
     - status_df: user_name, org_desc, curriculum_id, curriculum_title, curriculum_complete (Yes/No), days_remaining
 
     Salidas:
     - employee_kpis_df (1 fila por empleado)
-    - required_detail_df (1 fila por (empleado, curriculum en roles))
-    - extra_detail_df (1 fila por (empleado, curriculum completado no presente en roles))
+    - mandatory_detail_df (1 fila por (empleado, curriculum Mandatory) en Roles)
+    - optional_detail_df  (1 fila por (empleado, curriculum Optional) en Roles)
+
+    Reglas clave:
+    - is_assigned = True si existe registro en Trainings_Report para (empleado, curriculum_id)
+    - days_remaining:
+        * vacío (NaN) si curriculum_completed=True
+        * numérico si curriculum_completed=False (positivo = a tiempo, negativo = overdue)
+        * vacío (NaN) si is_assigned=False
+    - curriculum_done (bool):
+        * True si curriculum_completed=True
+        * True si curriculum_completed=False y days_remaining >= 0
+        * False si curriculum_completed=False y days_remaining < 0
+        * False si is_assigned=False
+
+    NOTA: se usa days_remaining >= 0 (incluye 0 como "a tiempo").
     """
     hr_df = hr_df.copy()
     roles_df = roles_df.copy()
@@ -107,8 +121,8 @@ def compute_employee_kpis(
         if c in status_df.columns:
             status_df[c] = status_df[c].astype(str).str.strip()
 
+    # asegurar is_mandatory
     if "is_mandatory" not in roles_df.columns and "required" in roles_df.columns:
-        # fallback: si por alguna razón roles_df viene sin is_mandatory pero con "required"
         req_norm = roles_df["required"].astype(str).str.strip().str.lower()
         roles_df["is_mandatory"] = req_norm.map({"mandatory": True, "obligatorio": True, "optional": False}).fillna(False)
 
@@ -144,249 +158,195 @@ def compute_employee_kpis(
         lambda r: resolve_emp_key(r.get("user_name"), r.get("org_desc")), axis=1
     )
 
+    # curriculum_completed + days_remaining
     status_df["curriculum_completed"] = status_df["curriculum_complete"].apply(_is_yes)
-
-    # Days Remaining: numérico (puede venir vacío).
     if "days_remaining" in status_df.columns:
         status_df["days_remaining"] = pd.to_numeric(status_df["days_remaining"], errors="coerce")
     else:
-        # por si el loader aún no lo incluyó (defensivo)
         status_df["days_remaining"] = pd.NA
 
-    # Regla: si el currículo ya está completado, Days Remaining debe quedar vacío.
-    status_df.loc[status_df["curriculum_completed"] == True, "days_remaining"] = pd.NA
-
-    # curriculum_done (booleano): True si completado, o si no completado pero NO está overdue (days_remaining >= 0).
-    status_df["curriculum_done"] = (
-        status_df["curriculum_completed"]
-        | ((~status_df["curriculum_completed"]) & status_df["days_remaining"].notna() & (status_df["days_remaining"] >= 0))
-    ).astype(bool)
-    status_completed = status_df[status_df["curriculum_completed"] == True].copy()  # noqa: E712
-
     # --- 3) Requisitos por empleado: merge HR x Roles (org_code + org_desc + job_title) ---
-    required = hr_df.merge(
+    required_all = hr_df.merge(
         roles_df,
         on=["org_code", "org_desc", "job_title"],
         how="left",
         suffixes=("", "_role"),
     )
+    required_all = required_all[~required_all["curriculum_id"].isna()].copy()
+    required_all["curriculum_id"] = required_all["curriculum_id"].astype(str)
 
-    required = required[~required["curriculum_id"].isna()].copy()
-    required["curriculum_id"] = required["curriculum_id"].astype(str)
-
-    # --- 4) Unir requisitos con status por (employee_key, curriculum_id) ---
+    # --- 4) Agregar status por (employee_key, curriculum_id) ---
     status_subset = status_df[["__employee_key", "curriculum_id", "curriculum_completed", "days_remaining"]].copy()
     status_subset = status_subset[~status_subset["__employee_key"].isna()].copy()
     status_subset["curriculum_id"] = status_subset["curriculum_id"].astype(str)
-    # Deduplicar por si hay múltiples registros del mismo currículo por empleado
-    # - curriculum_completed: True si cualquiera está completado
-    # - days_remaining: mínimo (más cercano / más overdue), ignorando NaN
-    status_subset = (
+
+    status_agg = (
         status_subset.groupby(["__employee_key", "curriculum_id"], as_index=False)
         .agg(
             curriculum_completed=("curriculum_completed", "max"),
             days_remaining=("days_remaining", "min"),
+            assigned_flag=("curriculum_id", "size"),
         )
     )
-    req_with_status = required.merge(
-        status_subset,
+    status_agg["assigned_flag"] = 1  # por si el size no se conserva como int en algunos pandas
+
+    req_with_status = required_all.merge(
+        status_agg,
         on=["__employee_key", "curriculum_id"],
         how="left",
     )
-    # is_assigned: True si existe registro en Trainings_Report para (empleado, curriculum)
-    req_with_status["is_assigned"] = req_with_status["curriculum_completed"].notna()
+
+    # is_assigned: True si existe registro en Trainings_Report
+    req_with_status["is_assigned"] = req_with_status["assigned_flag"].fillna(0).astype(int).astype(bool)
+    req_with_status = req_with_status.drop(columns=["assigned_flag"], errors="ignore")
+
+    # curriculum_completed: bool
     req_with_status["curriculum_completed"] = req_with_status["curriculum_completed"].fillna(False).astype(bool)
 
-    # curriculum_done (según Days Remaining + Curriculum Completed)
-    # - Si está completado: True
-    # - Si NO está completado y days_remaining >= 0: True (aún en tiempo)
-    # - Si NO está completado y days_remaining < 0: False (overdue)
-    # - Si NO está asignado: mantener days_remaining vacío y curriculum_done=False
-    req_with_status["curriculum_done"] = (
-        req_with_status["curriculum_completed"]
-        | (
-            req_with_status["is_assigned"]
-            & (~req_with_status["curriculum_completed"])
-            & req_with_status["days_remaining"].notna()
-            & (req_with_status["days_remaining"] >= 0)
+    # days_remaining: vacío cuando no asignado o cuando ya completó
+    req_with_status.loc[~req_with_status["is_assigned"], "days_remaining"] = pd.NA
+    req_with_status.loc[req_with_status["curriculum_completed"], "days_remaining"] = pd.NA
+
+    # curriculum_done: bool (ver reglas en docstring)
+    req_with_status["curriculum_done"] = False
+    assigned = req_with_status["is_assigned"]
+    completed = req_with_status["curriculum_completed"]
+    req_with_status.loc[assigned & completed, "curriculum_done"] = True
+    mask_pending = assigned & (~completed)
+    req_with_status.loc[mask_pending, "curriculum_done"] = (
+        req_with_status.loc[mask_pending, "days_remaining"].astype("float").ge(0).fillna(False)
+    )
+    req_with_status["curriculum_done"] = req_with_status["curriculum_done"].astype(bool)
+
+    # --- 5) Detalles: se separa Mandatory vs Optional ---
+    base_detail_cols = [
+        "__employee_key",
+        "full_name",
+        "job_title",
+        "org_code",
+        "org_desc",
+        "head_of_department",
+        "curriculum_id",
+        "curriculum_title",
+        "is_assigned",
+        "curriculum_completed",
+        "days_remaining",
+        "curriculum_done",
+    ]
+
+    mandatory_detail_df = req_with_status[req_with_status["is_mandatory"] == True][base_detail_cols].copy()  # noqa: E712
+    optional_detail_df = req_with_status[req_with_status["is_mandatory"] == False][base_detail_cols].copy()   # noqa: E712
+
+    # Orden para detalles (sin la llave interna)
+    detail_order = [c for c in base_detail_cols if c != "__employee_key"]
+    mandatory_detail_df = mandatory_detail_df[detail_order].copy()
+    optional_detail_df = optional_detail_df[detail_order].copy()
+
+    # --- 6) KPIs por empleado (solo Mandatory para conteos principales) ---
+    base_emp = hr_df[[
+        "__employee_key",
+        "full_name",
+        "job_title",
+        "org_code",
+        "org_desc",
+        "head_of_department",
+    ]].copy()
+
+    # agregados mandatory por currículo (para evitar dobles conteos)
+    if not mandatory_detail_df.empty:
+        mand_tmp = req_with_status[req_with_status["is_mandatory"] == True].copy()  # noqa: E712
+        mand_curr = (
+            mand_tmp.groupby(["__employee_key", "curriculum_id"], as_index=False)
+            .agg(
+                curriculum_completed=("curriculum_completed", "max"),
+                curriculum_done=("curriculum_done", "max"),
+                is_assigned=("is_assigned", "max"),
+            )
         )
+        mand_agg = mand_curr.groupby("__employee_key").agg(
+            mandatory_count=("curriculum_id", "nunique"),
+            mandatory_completed_count=("curriculum_completed", "sum"),
+            mandatory_done_count=("curriculum_done", "sum"),
+        ).reset_index()
+        unassigned = (
+            mand_curr.groupby("__employee_key")["is_assigned"]
+            .apply(lambda s: int((~s.astype(bool)).sum()))
+            .reset_index(name="unassigned_mandatory_count")
+        )
+        mand_agg = mand_agg.merge(unassigned, on="__employee_key", how="left")
+    else:
+        mand_agg = pd.DataFrame({"__employee_key": base_emp["__employee_key"]})
+        mand_agg["mandatory_count"] = 0
+        mand_agg["mandatory_completed_count"] = 0
+        mand_agg["mandatory_done_count"] = 0
+        mand_agg["unassigned_mandatory_count"] = 0
+
+    # agregados Optional (solo completados)
+    if not optional_detail_df.empty:
+        opt_tmp = req_with_status[req_with_status["is_mandatory"] == False].copy()  # noqa: E712
+        opt_curr = (
+            opt_tmp.groupby(["__employee_key", "curriculum_id"], as_index=False)
+            .agg(curriculum_completed=("curriculum_completed", "max"))
+        )
+        opt_agg = opt_curr.groupby("__employee_key").agg(
+            optional_completed_count=("curriculum_completed", "sum"),
+        ).reset_index()
+    else:
+        opt_agg = pd.DataFrame({"__employee_key": base_emp["__employee_key"]})
+        opt_agg["optional_completed_count"] = 0
+
+    employee_kpis_df = base_emp.merge(mand_agg, on="__employee_key", how="left")
+    employee_kpis_df = employee_kpis_df.merge(opt_agg, on="__employee_key", how="left")
+
+    # defaults/tipos
+    for col in [
+        "mandatory_count",
+        "mandatory_completed_count",
+        "mandatory_done_count",
+        "unassigned_mandatory_count",
+        "optional_completed_count",
+    ]:
+        employee_kpis_df[col] = employee_kpis_df[col].fillna(0).astype(int)
+
+    employee_kpis_df["mandatory_missing_count"] = (
+        employee_kpis_df["mandatory_count"] - employee_kpis_df["mandatory_completed_count"]
+    ).astype(int)
+
+    employee_kpis_df["has_requirements"] = employee_kpis_df["mandatory_count"] > 0
+
+    employee_kpis_df["completion_pct"] = employee_kpis_df.apply(
+        lambda r: (100.0 * r["mandatory_completed_count"] / r["mandatory_count"]) if r["mandatory_count"] > 0 else None,
+        axis=1,
+    ).astype(float)
+
+    employee_kpis_df["full_compliance_flag"] = (
+        employee_kpis_df["has_requirements"] & (employee_kpis_df["mandatory_missing_count"] == 0)
     ).astype(bool)
 
-    # --- 5) Agregados por empleado ---
-    agg_req = (
-        req_with_status.groupby("__employee_key")
-        .agg(
-            required_count=("curriculum_id", "nunique"),
-            completed_required_count=("curriculum_completed", "sum"),
-            done_required_count=("curriculum_done", "sum"),
-        )
-        .reset_index()
-    )
-    # mandatorios sin asignar (no hay registro en Trainings_Report)
-    unassigned = (
-        req_with_status[(req_with_status["is_mandatory"] == True) & (~req_with_status["is_assigned"])]
-        .groupby("__employee_key")
-        .size()
-        .rename("unassigned_mandatory_count")
-        .reset_index()
-    )
-    agg_req = agg_req.merge(unassigned, on="__employee_key", how="left")
-    agg_req["unassigned_mandatory_count"] = agg_req["unassigned_mandatory_count"].fillna(0).astype(int)
+    employee_kpis_df["full_done_flag"] = (
+        employee_kpis_df["has_requirements"] & (employee_kpis_df["mandatory_done_count"] == employee_kpis_df["mandatory_count"])
+    ).astype(bool)
 
-    agg_req["missing_required_count"] = agg_req["required_count"] - agg_req["completed_required_count"]
-    agg_req["has_requirements"] = agg_req["required_count"] > 0
-    agg_req["completion_pct"] = agg_req.apply(
-        lambda r: (100.0 * r["completed_required_count"] / r["required_count"]) if r["required_count"] > 0 else None,
-        axis=1,
-    )
-    agg_req["full_compliance_flag"] = agg_req["has_requirements"] & (agg_req["missing_required_count"] == 0)
-    agg_req["full_done_flag"] = agg_req["has_requirements"] & (agg_req["done_required_count"] == agg_req["required_count"])
+    # Orden final
+    employee_kpis_df = employee_kpis_df[[
+        "full_name",
+        "job_title",
+        "org_code",
+        "org_desc",
+        "head_of_department",
+        "mandatory_count",
+        "mandatory_completed_count",
+        "mandatory_done_count",
+        "mandatory_missing_count",
+        "unassigned_mandatory_count",
+        "has_requirements",
+        "completion_pct",
+        "full_compliance_flag",
+        "full_done_flag",
+        "optional_completed_count",
+    ]].copy()
 
-    # --- 6) Employee KPIs (incluye empleados sin requisitos) ---
-    base_emp = hr_df[
-        [
-            "__employee_key",
-            "full_name",
-            "job_title",
-            "org_code",
-            "org_desc",
-            "head_of_department",
-        ]
-    ].copy()
-
-    employee_kpis_df = base_emp.merge(agg_req, on="__employee_key", how="left")
-
-    for col in ["required_count", "completed_required_count", "done_required_count", "missing_required_count", "unassigned_mandatory_count"]:
-        employee_kpis_df[col] = employee_kpis_df[col].fillna(0).astype(int)
-    employee_kpis_df["has_requirements"] = employee_kpis_df["required_count"] > 0
-    employee_kpis_df["completion_pct"] = employee_kpis_df["completion_pct"].astype(float)
-    employee_kpis_df["full_compliance_flag"] = employee_kpis_df["full_compliance_flag"].fillna(False).astype(bool)
-    employee_kpis_df["full_done_flag"] = employee_kpis_df["full_done_flag"].fillna(False).astype(bool)
-
-    # --- 7) Detalle requerido ---
-    required_detail_df = req_with_status[
-        [
-            "__employee_key",
-            "full_name",
-            "job_title",
-            "org_code",
-            "org_desc",
-            "head_of_department",
-            "curriculum_id",
-            "curriculum_title",
-            "is_mandatory",
-            "is_assigned",
-            "curriculum_completed",
-            "days_remaining",
-            "curriculum_done",
-        ]
-    ].copy()
-
-    # --- 8) Extra (completados que no aparecen en Roles para el empleado) ---
-    required_keys = set(zip(required["__employee_key"].astype(str), required["curriculum_id"].astype(str)))
-
-    status_completed = status_completed[~status_completed["__employee_key"].isna()].copy()
-    status_completed["curriculum_id"] = status_completed["curriculum_id"].astype(str)
-
-    def _is_extra(row) -> bool:
-        return (str(row["__employee_key"]), str(row["curriculum_id"])) not in required_keys
-
-    status_completed["__is_extra"] = status_completed.apply(_is_extra, axis=1)
-    extra_detail_df = status_completed[status_completed["__is_extra"]].copy()
-
-    # Añadir columnas de HR
-    extra_detail_df = extra_detail_df.merge(
-        hr_df[
-            [
-                "__employee_key",
-                "full_name",
-                "job_title",
-                "org_code",
-                "org_desc",
-                "head_of_department",
-            ]
-        ],
-        on="__employee_key",
-        how="left",
-        suffixes=("", "_hr"),
-    )
-    extra_detail_df["is_mandatory"] = False
-
-    extra_detail_df = extra_detail_df[
-        [
-            "full_name",
-            "job_title",
-            "org_code",
-            "org_desc",
-            "head_of_department",
-            "curriculum_id",
-            "curriculum_title",
-            "is_mandatory",
-            "curriculum_completed",
-            "days_remaining",
-            "curriculum_done",
-        ]
-    ].copy()
-
-    # --- 9) extra_completed_count ---
-    if extra_detail_df.empty:
-        employee_kpis_df["extra_completed_count"] = 0
-    else:
-        ex = (
-            extra_detail_df.groupby(["full_name", "org_code", "org_desc", "job_title"])  # estable aunque haya homónimos
-            ["curriculum_id"]
-            .nunique()
-            .reset_index(name="extra_completed_count")
-        )
-        employee_kpis_df = employee_kpis_df.merge(
-            ex,
-            on=["full_name", "org_code", "org_desc", "job_title"],
-            how="left",
-        )
-        employee_kpis_df["extra_completed_count"] = employee_kpis_df["extra_completed_count"].fillna(0).astype(int)
-
-    # Reindex/orden exacto solicitado para employee_kpis
-    employee_kpis_df = employee_kpis_df[
-        [
-            "full_name",
-            "job_title",
-            "org_code",
-            "org_desc",
-            "head_of_department",
-            "required_count",
-            "completed_required_count",
-            "done_required_count",
-            "missing_required_count",
-            "unassigned_mandatory_count",
-            "has_requirements",
-            "completion_pct",
-            "full_compliance_flag",
-            "full_done_flag",
-            "extra_completed_count",
-        ]
-    ].copy()
-
-    # Orden para detalles
-    required_detail_df = required_detail_df[
-        [
-            "full_name",
-            "job_title",
-            "org_code",
-            "org_desc",
-            "head_of_department",
-            "curriculum_id",
-            "curriculum_title",
-            "is_mandatory",
-            "is_assigned",
-            "curriculum_completed",
-            "days_remaining",
-            "curriculum_done",
-        ]
-    ].copy()
-
-    # En extra_detail_df ya viene con el orden correcto
-
-    return employee_kpis_df, required_detail_df, extra_detail_df
+    return employee_kpis_df, mandatory_detail_df, optional_detail_df
 
 
 def compute_department_kpis(employee_kpis_df: pd.DataFrame) -> pd.DataFrame:
@@ -488,8 +448,8 @@ def compute_organization_kpis(employee_kpis_df: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
-def compute_company_kpis(employee_kpis_df: pd.DataFrame, required_detail_df: pd.DataFrame) -> pd.DataFrame:
-    """KPIs agregados a nivel empresa."""
+def compute_company_kpis(employee_kpis_df: pd.DataFrame, mandatory_detail_df: pd.DataFrame) -> pd.DataFrame:
+    """KPIs agregados a nivel empresa (basados en Mandatory)."""
     df = employee_kpis_df.copy()
 
     total_employees = int(len(df))
@@ -501,10 +461,10 @@ def compute_company_kpis(employee_kpis_df: pd.DataFrame, required_detail_df: pd.
         employees_full_compliance / employees_with_requirements if employees_with_requirements > 0 else None
     )
 
-    total_required_curricula = int(len(required_detail_df))
-    total_completed_required = int(required_detail_df["curriculum_completed"].sum()) if total_required_curricula > 0 else 0
-    curricula_completion_rate = (
-        (total_completed_required / total_required_curricula) if total_required_curricula > 0 else None
+    total_mandatory_curricula = int(len(mandatory_detail_df))
+    total_completed_mandatory = int(mandatory_detail_df["curriculum_completed"].sum()) if total_mandatory_curricula > 0 else 0
+    mandatory_curricula_completion_rate = (
+        (total_completed_mandatory / total_mandatory_curricula) if total_mandatory_curricula > 0 else None
     )
 
     data = {
@@ -513,9 +473,9 @@ def compute_company_kpis(employee_kpis_df: pd.DataFrame, required_detail_df: pd.
         "employees_full_compliance": employees_full_compliance,
         "avg_completion_pct": avg_completion_pct,
         "company_full_compliance_rate": company_full_compliance_rate,
-        "total_required_curricula": total_required_curricula,
-        "total_completed_required": total_completed_required,
-        "curricula_completion_rate": curricula_completion_rate,
+        "total_mandatory_curricula": total_mandatory_curricula,
+        "total_completed_mandatory": total_completed_mandatory,
+        "mandatory_curricula_completion_rate": mandatory_curricula_completion_rate,
     }
 
     return pd.DataFrame([data])

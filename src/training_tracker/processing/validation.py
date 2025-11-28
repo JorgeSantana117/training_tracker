@@ -111,7 +111,7 @@ def validate_data(
                     "code": "HR_EMPLOYEE_WITHOUT_ROLE_REQUIREMENTS",
                     "message": (
                         f"{len(no_req)} combinaciones (org_code, org_desc, job_title) en HR no tienen requisitos en Roles. "
-                        "Estos empleados saldrán con required_count=0."
+                        "Estos empleados saldrán con mandatory_count=0."
                     ),
                     "details": {"sample": no_req.head(10).to_dict(orient="records")},
                 }
