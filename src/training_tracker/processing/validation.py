@@ -84,7 +84,7 @@ def validate_data(
         )
 
     # --- Status ---
-    status_needed = {"user_name", "org_desc", "curriculum_id", "curriculum_title", "curriculum_complete"}
+    status_needed = {"user_name", "org_desc", "curriculum_id", "curriculum_title", "curriculum_complete", "days_remaining"}
     status_missing = sorted(list(status_needed - set(status_df.columns)))
     if status_missing:
         issues.append(
